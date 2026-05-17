@@ -49,19 +49,51 @@ That's it. Kanna opens in your browser at [`localhost:3210`](http://localhost:32
 
 ## Features
 
-- **Multi-provider support** — switch between Claude and Codex (OpenAI) from the chat input, with per-provider model selection, reasoning effort controls, and Codex fast mode
+**Providers & models**
+
+- **Multi-provider support** — switch between Claude and Codex (OpenAI) from the chat input, with per-provider model selection, reasoning-effort controls, and Codex fast mode
+- **OAuth token pool** — register multiple Claude OAuth tokens; Kanna rotates across them per chat
+- **Subscription-billing PTY driver** — optional `KANNA_CLAUDE_DRIVER=pty` runs the `claude` CLI under a pseudo-terminal so Pro/Max subscription billing is preserved instead of API rates
+
+**Chat & transcript**
+
+- **Rich transcript rendering** — hydrated tool calls, collapsible tool groups, plan-mode dialogs, and interactive prompts with full result display
+- **Inline diff viewer** — file and commit diffs rendered directly in the transcript
+- **Embedded terminal** — per-project xterm terminal in a resizable side panel (macOS/Linux)
+- **File & image uploads** — drag-and-drop attachments into the composer
+- **Slash commands & @-mentions** — in-composer pickers for slash commands, file mentions, and subagents
+- **Plan mode** — review and approve agent plans before execution
+- **Subagent orchestration** — run and track parallel subagents within a turn
+- **Background tasks** — long-running tasks tracked out-of-band with a status indicator
+- **Auto-continue** — optionally continue a turn automatically when the agent stops short
+- **Proactive compaction** — context-window meter with automatic transcript compaction before limits are hit
+
+**Projects & sessions**
+
 - **Project-first sidebar** — chats grouped under projects, with live status indicators (idle, running, waiting, failed)
 - **Drag-and-drop project ordering** — reorder project groups in the sidebar with persistent ordering
 - **Local project discovery** — auto-discovers projects from both Claude and Codex local history
 - **Bulk import Claude Code sessions** — one-click import of existing `~/.claude/projects/` sessions with full transcript and seamless resume via the Claude Agent SDK
-- **Rich transcript rendering** — hydrated tool calls, collapsible tool groups, plan mode dialogs, and interactive prompts with full result display
-- **Quick responses** — lightweight structured queries (e.g. title generation) via Haiku with automatic Codex fallback
-- **Plan mode** — review and approve agent plans before execution
-- **Persistent local history** — refresh-safe routes backed by JSONL event logs and compacted snapshots
-- **Auto-generated titles** — chat titles generated in the background via Claude Haiku
+- **Git worktree isolation** — run a chat in an isolated worktree without disturbing your working tree
 - **Session resumption** — resume agent sessions with full context preservation
+- **Auto-generated titles** — chat titles generated in the background via Claude Haiku
+- **Quick responses** — lightweight structured queries (e.g. title generation) via Haiku with automatic Codex fallback
+
+**Persistence & realtime**
+
+- **Persistent local history** — refresh-safe routes backed by append-only JSONL event logs and compacted snapshots
 - **WebSocket-driven** — real-time subscription model with reactive state broadcasting
+- **Standalone transcript export** — export a chat as a self-contained HTML viewer
+
+**Access & notifications**
+
+- **Password protection** — optional launch password gating the app, WebSocket, and API routes
+- **Public share link** — `--share` creates a temporary `trycloudflare.com` URL with a terminal QR code
 - **Cloudflare tunnel via `expose_port` tool** — opt-in; the agent proactively calls the Kanna `expose_port` MCP tool with a port. In `always-ask` mode Kanna shows an inline "expose via Cloudflare" card for you to accept; in `auto-expose` mode `cloudflared tunnel --url` spawns immediately. Both modes are gated by the Cloudflare Tunnel setting
+- **Web push & sound notifications** — browser push and sound alerts when a chat needs attention
+- **Customizable keybindings** — user-editable keyboard shortcuts
+- **In-app self-update** — one-click update that pulls, rebuilds, and hot-reloads (host-agnostic supervisor or pm2)
+- **Mobile-friendly** — responsive layout, installable as a standalone PWA
 
 ## Architecture
 
@@ -69,14 +101,22 @@ That's it. Kanna opens in your browser at [`localhost:3210`](http://localhost:32
 Browser (React + Zustand)
     ↕  WebSocket
 Bun Server (HTTP + WS)
-    ├── WSRouter ─── subscription & command routing
-    ├── AgentCoordinator ─── multi-provider turn management
-    ├── ProviderCatalog ─── provider/model/effort normalization
-    ├── QuickResponseAdapter ─── structured queries with provider fallback
-    ├── EventStore ─── JSONL persistence + snapshot compaction
-    └── ReadModels ─── derived views (sidebar, chat, projects)
-    ↕  stdio
-Claude Agent SDK / Codex App Server (local processes)
+    ├── Auth ───────────── optional password gate (HTTP/WS/API)
+    ├── WSRouter ───────── subscription & command routing
+    ├── AgentCoordinator ─ multi-provider turn management
+    ├── ProviderCatalog ── provider/model/effort normalization
+    ├── QuickResponse ──── structured queries with provider fallback
+    ├── EventStore ─────── append-only JSONL + snapshot compaction
+    ├── ReadModels ─────── derived views (sidebar, chat, projects)
+    ├── DiffStore ──────── per-chat diff hydration
+    ├── TerminalManager ── PTY sessions for the embedded terminal
+    ├── Uploads ────────── drag-drop attachment intake
+    ├── Discovery ──────── scan Claude/Codex local history
+    ├── Push ───────────── web-push notifications
+    ├── Share / Tunnel ─── trycloudflare + cloudflared
+    └── UpdateManager ──── self-update + reload strategy
+    ↕  stdio / PTY
+Claude Agent SDK · Claude CLI (PTY) · Codex App Server
     ↕
 Local File System (~/.kanna/data/, project dirs)
 ```
@@ -85,7 +125,7 @@ Local File System (~/.kanna/data/, project dirs)
 
 ## Requirements
 
-- [Bun](https://bun.sh) v1.3.5+
+- [Bun](https://bun.sh) v1.3.11+
 - A working [Claude Code](https://docs.anthropic.com/en/docs/claude-code) environment
 - _(Optional)_ [Codex CLI](https://github.com/openai/codex) for Codex provider support
 
@@ -119,6 +159,7 @@ bun run build
 ```bash
 kanna                  # start with defaults (localhost only)
 kanna --port 4000      # custom port
+kanna --strict-port    # fail instead of trying another port
 kanna --no-open        # don't open browser
 kanna --password <secret>      # require a password before loading the app
 kanna --share                # create a public quick tunnel + terminal QR
@@ -223,43 +264,63 @@ bun run dev:server   # http://localhost:5175
 
 ## Scripts
 
-| Command              | Description                  |
-| -------------------- | ---------------------------- |
-| `bun run build`      | Build for production         |
-| `bun run check`      | Typecheck + build            |
-| `bun run dev`        | Run client + server together |
-| `bun run dev:client` | Vite dev server only         |
-| `bun run dev:server` | Bun backend only             |
-| `bun run start`      | Start production server      |
+| Command              | Description                          |
+| -------------------- | ------------------------------------ |
+| `bun run build`      | Build client + standalone export viewer |
+| `bun run check`      | Typecheck, lint, and build           |
+| `bun run lint`       | ESLint over `src/` (zero-warning gate) |
+| `bun run dev`        | Run client + server together         |
+| `bun run dev:client` | Vite dev server only (`:5174`)       |
+| `bun run dev:server` | Bun backend only (`:5175`)           |
+| `bun run start`      | Start production server              |
+| `bun test`           | Run the test suite                   |
 
 ## Project Structure
+
+Abridged — the actual tree has more modules, each with co-located `*.test.ts`:
 
 ```
 src/
 ├── client/          React UI layer
 │   ├── app/         App router, pages, central state hook, socket client
-│   ├── components/  Messages, chat chrome, dialogs, buttons, inputs
-│   ├── hooks/       Theme, standalone mode detection
-│   ├── stores/      Zustand stores (chat input, preferences, project order)
-│   └── lib/         Formatters, path utils, transcript parsing
+│   ├── components/  chat-ui, messages, settings, ui primitives, modals
+│   ├── hooks/       mobile/standalone detection, theme, mention/slash suggestions
+│   ├── stores/      Zustand stores (chat input, preferences, terminal, tasks…)
+│   └── lib/         formatters, path utils, transcript parsing, keybindings
 ├── server/          Bun backend
-│   ├── cli.ts       CLI entry point & browser launcher
-│   ├── server.ts    HTTP/WS server setup & static serving
-│   ├── agent.ts     AgentCoordinator (multi-provider turn management)
-│   ├── codex-app-server.ts  Codex App Server JSON-RPC client
-│   ├── provider-catalog.ts  Provider/model/effort normalization
-│   ├── quick-response.ts    Structured queries with provider fallback
-│   ├── ws-router.ts WebSocket message routing & subscriptions
-│   ├── event-store.ts  JSONL persistence, replay & compaction
-│   ├── discovery.ts Auto-discover projects from Claude and Codex local state
-│   ├── read-models.ts  Derive view models from event state
-│   └── events.ts    Event type definitions
+│   ├── cli.ts · cli-runtime.ts   CLI entry, flag parsing, supervisor
+│   ├── server.ts                 HTTP/WS server + static serving
+│   ├── auth.ts                   password gate for HTTP/WS/API
+│   ├── ws-router.ts              WebSocket routing & subscriptions
+│   ├── agent.ts                  AgentCoordinator (multi-provider turns)
+│   ├── codex-app-server.ts       Codex App Server JSON-RPC client
+│   ├── claude-pty/               PTY driver (subscription billing)
+│   ├── oauth-pool/               Claude OAuth token rotation
+│   ├── provider-catalog.ts       provider/model/effort normalization
+│   ├── quick-response.ts         structured queries w/ provider fallback
+│   ├── event-store.ts            JSONL persistence, replay & compaction
+│   ├── read-models.ts            derived view models
+│   ├── events.ts                 event type definitions
+│   ├── discovery.ts              auto-discover Claude/Codex projects
+│   ├── claude-session-importer.ts  bulk import existing sessions
+│   ├── diff-store.ts             per-chat diff hydration
+│   ├── terminal-manager.ts       embedded-terminal PTY sessions
+│   ├── uploads.ts                attachment intake
+│   ├── subagent-orchestrator.ts  parallel subagent runs
+│   ├── background-tasks.ts       out-of-band task tracking
+│   ├── worktree-store.ts         git worktree isolation
+│   ├── push/                     web-push notifications
+│   ├── share.ts · cloudflare-tunnel/  trycloudflare / expose_port tunnels
+│   ├── update-manager.ts · update-strategy.ts  self-update
+│   ├── kanna-mcp.ts              Kanna MCP tools (built-in shims)
+│   └── keybindings.ts            persisted keybindings
 └── shared/          Shared between client & server
-    ├── types.ts     Core data types, provider catalog, transcript entries
-    ├── tools.ts     Tool call normalization and hydration
-    ├── protocol.ts  WebSocket message protocol
-    ├── ports.ts     Port configuration
-    └── branding.ts  App name, data directory paths
+    ├── types.ts     core domain types, provider catalog, transcript entries
+    ├── tools.ts     tool-call normalization & hydration
+    ├── protocol.ts  WebSocket wire envelopes
+    ├── ports.ts     default ports & dev-mode offsets
+    ├── share.ts     share/tunnel shared types
+    └── branding.ts  app name & data-directory paths
 ```
 
 ## Data Storage
