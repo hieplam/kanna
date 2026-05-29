@@ -63,11 +63,15 @@ t("pointerdown on drag handle then pointermove dy>120 + pointerup → onOpenChan
   })
   document.body.appendChild(container)
   const root = createRoot(container)
+  // Text source renders TextBody (no eager fetch under happy-dom); a zip/PDF source
+  // would render an <iframe> whose async load mutates the DOM during unmount and
+  // races React's removeChild teardown. The drag handle is body-agnostic.
+  const textSource: PreviewSource = { ...SRC, contentUrl: "/u/r.txt", displayName: "r.txt", fileName: "r.txt", mimeType: "text/plain" }
   // Render SheetBody directly inside Dialog (no portal) so the handle lands in container
   await act(async () => {
     root.render(
       <Dialog open>
-        <SheetBody source={SRC} onClose={() => onOpenChange.call(false)} />
+        <SheetBody source={textSource} onClose={() => onOpenChange.call(false)} />
       </Dialog>
     )
   })
