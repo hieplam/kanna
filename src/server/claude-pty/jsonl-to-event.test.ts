@@ -61,6 +61,16 @@ describe("parseJsonlLine", () => {
     const rl = events.find((e) => e.type === "rate_limit")
     expect(rl).toBeUndefined()
   })
+
+  test("sidechain (subagent) line → no events", () => {
+    const line = JSON.stringify({
+      type: "assistant",
+      isSidechain: true,
+      session_id: "sub-sess",
+      message: { role: "assistant", content: [{ type: "text", text: "subagent thinking" }] },
+    })
+    expect(parseJsonlLine(line)).toEqual([])
+  })
 })
 
 describe("createJsonlEventParser", () => {
@@ -238,4 +248,189 @@ describe("createJsonlEventParser", () => {
     expect(types[0]).toBe("session_token")
   })
 
+  // A Task subagent writes its own messages into the parent transcript with
+  // isSidechain:true. They must never reach the main turn stream: a sidechain
+  // `result` (or its TUI `turn_duration` synth) would shift the parent's
+  // pending prompt seq and finalize the user turn early (UI flips idle while
+  // the main turn is still streaming); a sidechain session_id would clobber
+  // the parent chat's claude session token.
+  test("sidechain result → no transcript result entry and no session_token", () => {
+    const parser = createJsonlEventParser()
+    const line = JSON.stringify({
+      type: "result",
+      isSidechain: true,
+      session_id: "sub-sess",
+      subtype: "success",
+      result: "subagent done",
+      isError: false,
+      duration_ms: 1000,
+    })
+    const events = parser.parse(line)
+    expect(events).toEqual([])
+  })
+
+  test("sidechain turn_duration → no synthesized result entry", () => {
+    const parser = createJsonlEventParser()
+    const line = JSON.stringify({
+      type: "system",
+      subtype: "turn_duration",
+      isSidechain: true,
+      session_id: "sub-sess",
+      durationMs: 1234,
+    })
+    const events = parser.parse(line)
+    const resultEntries = events.filter(
+      (e) => e.type === "transcript" && (e.entry as { kind?: string }).kind === "result",
+    )
+    expect(resultEntries).toEqual([])
+    expect(events.find((e) => e.type === "session_token")).toBeUndefined()
+  })
+
+  test("non-sidechain turn_duration still synthesizes a result (regression guard)", () => {
+    const parser = createJsonlEventParser()
+    const line = JSON.stringify({
+      type: "system",
+      subtype: "turn_duration",
+      session_id: "main-sess",
+      durationMs: 1234,
+    })
+    const events = parser.parse(line)
+    const resultEntries = events.filter(
+      (e) => e.type === "transcript" && (e.entry as { kind?: string }).kind === "result",
+    )
+    expect(resultEntries).toHaveLength(1)
+  })
+
+  // Claude Code TUI's background task queue (`enqueuePendingNotification` +
+  // `useQueueProcessor`) can auto-spawn a follow-up turn after `end_turn` when
+  // a `run_in_background:true` bash exits. The wake injects a synthetic
+  // `<task-notification>` user message with `isMeta:true` and runs another
+  // model query. Kanna never sent a `chat_send` for this turn, so its
+  // `result`/`turn_duration` must NOT consume a queued `pendingPromptSeq`
+  // (which would steal a real user turn's seq) and must NOT alter Kanna's
+  // turn lifecycle. Drop both the synthetic user line and the wake's final
+  // result. Mid-turn `isMeta:true` injections (FileReadTool metadata, token
+  // budget continuation) are distinguished by arriving AFTER an assistant
+  // message in the same turn and must be left alone.
+  describe("background auto-wake filtering", () => {
+    function makeMetaUser(content: string): string {
+      return JSON.stringify({
+        type: "user",
+        isMeta: true,
+        message: { role: "user", content },
+      })
+    }
+    function makeRealUser(text: string): string {
+      return JSON.stringify({
+        type: "user",
+        message: { role: "user", content: text },
+      })
+    }
+    function makeAssistant(text: string): string {
+      return JSON.stringify({
+        type: "assistant",
+        message: { role: "assistant", content: [{ type: "text", text }] },
+      })
+    }
+    function makeResult(): string {
+      return JSON.stringify({
+        type: "result",
+        subtype: "success",
+        isError: false,
+        duration_ms: 100,
+        result: "",
+      })
+    }
+    function makeTurnDuration(): string {
+      return JSON.stringify({
+        type: "system",
+        subtype: "turn_duration",
+        session_id: "main-sess",
+        durationMs: 100,
+      })
+    }
+    function resultEntries(events: HarnessEvent[]) {
+      return events.filter(
+        (e) => e.type === "transcript" && (e.entry as { kind?: string }).kind === "result",
+      )
+    }
+
+    test("auto-wake: meta user at turn boundary → drop the synthetic user line", () => {
+      const parser = createJsonlEventParser()
+      // First a real turn ends, putting parser in between-turns state.
+      parser.parse(makeRealUser("hi"))
+      parser.parse(makeAssistant("hello"))
+      parser.parse(makeResult())
+      // Then a synthetic isMeta user arrives — the auto-wake.
+      const events = parser.parse(makeMetaUser("<task-notification>bash done</task-notification>"))
+      const userEntries = events.filter(
+        (e) => e.type === "transcript" && (e.entry as { kind?: string }).kind === "user_prompt",
+      )
+      expect(userEntries).toEqual([])
+    })
+
+    test("auto-wake: result following meta user at turn boundary is dropped", () => {
+      const parser = createJsonlEventParser()
+      parser.parse(makeRealUser("hi"))
+      parser.parse(makeAssistant("hello"))
+      parser.parse(makeResult())
+      parser.parse(makeMetaUser("<task-notification>bash done</task-notification>"))
+      parser.parse(makeAssistant("acknowledged"))
+      const events = parser.parse(makeResult())
+      expect(resultEntries(events)).toEqual([])
+    })
+
+    test("auto-wake: turn_duration following meta user at turn boundary is dropped", () => {
+      const parser = createJsonlEventParser()
+      parser.parse(makeRealUser("hi"))
+      parser.parse(makeAssistant("hello"))
+      parser.parse(makeTurnDuration())
+      parser.parse(makeMetaUser("<task-notification>bash done</task-notification>"))
+      parser.parse(makeAssistant("acknowledged"))
+      const events = parser.parse(makeTurnDuration())
+      expect(resultEntries(events)).toEqual([])
+    })
+
+    test("mid-turn meta user (e.g. FileRead metadata) does NOT drop the next result", () => {
+      const parser = createJsonlEventParser()
+      parser.parse(makeRealUser("read a file"))
+      parser.parse(makeAssistant("calling FileRead"))
+      // Mid-turn isMeta injection — appears AFTER assistant.
+      parser.parse(makeMetaUser("<file-metadata>...</file-metadata>"))
+      parser.parse(makeAssistant("done"))
+      const events = parser.parse(makeResult())
+      // The real turn-end result must still be emitted.
+      expect(resultEntries(events).length).toBeGreaterThan(0)
+    })
+
+    test("auto-wake chain: two consecutive wakes both dropped, real turn after still emits", () => {
+      const parser = createJsonlEventParser()
+      parser.parse(makeRealUser("hi"))
+      parser.parse(makeAssistant("hello"))
+      parser.parse(makeResult())
+      // First wake.
+      parser.parse(makeMetaUser("<task-notification>A done</task-notification>"))
+      parser.parse(makeAssistant("ack A"))
+      expect(resultEntries(parser.parse(makeResult()))).toEqual([])
+      // Second wake immediately after.
+      parser.parse(makeMetaUser("<task-notification>B done</task-notification>"))
+      parser.parse(makeAssistant("ack B"))
+      expect(resultEntries(parser.parse(makeResult()))).toEqual([])
+      // Next REAL user prompt → its result must emit.
+      parser.parse(makeRealUser("status?"))
+      parser.parse(makeAssistant("all good"))
+      expect(resultEntries(parser.parse(makeResult())).length).toBeGreaterThan(0)
+    })
+
+    test("auto-wake: assistant text inside a wake is still emitted (user sees model output)", () => {
+      const parser = createJsonlEventParser()
+      parser.parse(makeRealUser("hi"))
+      parser.parse(makeAssistant("hello"))
+      parser.parse(makeResult())
+      parser.parse(makeMetaUser("<task-notification>bash done</task-notification>"))
+      const events = parser.parse(makeAssistant("bash exited 0"))
+      const transcript = events.filter((e) => e.type === "transcript")
+      expect(transcript.length).toBeGreaterThan(0)
+    })
+  })
 })
