@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { startClaudeSessionPTY, buildPtyEnv, buildPtyCliArgs, OutputRing, PTY_STDERR_RING_BYTES, PTY_DISALLOWED_NATIVE_TOOLS, deriveAccountInfoFromOauth, PLAN_MODE_EXIT_UNSUPPORTED, SHIFT_TAB_KEY } from "./driver"
+import { startClaudeSessionPTY, buildPtyEnv, buildPtyCliArgs, OutputRing, PTY_STDERR_RING_BYTES, PTY_DISALLOWED_NATIVE_TOOLS, deriveAccountInfoFromOauth, PLAN_MODE_EXIT_UNSUPPORTED, SHIFT_TAB_KEY, buildChannelPromptFraming } from "./driver"
 import type { TranscriptStream } from "./tui-source.adapter"
 import type { PtyProcess, SpawnPtyProcessArgs } from "./pty-process.adapter"
 import { KANNA_SYSTEM_PROMPT_APPEND } from "../../shared/kanna-system-prompt"
@@ -838,6 +838,134 @@ describe("session close escalation (graceful → SIGTERM → SIGKILL)", () => {
   }, 10_000)
 })
 
+describe("keep-alive (Task 1)", () => {
+  test("keepAlive: does NOT send /exit on first result, exposes pushChannelPrompt", async () => {
+    if (process.platform === "win32") return
+    const exitCalls: string[] = []
+    const pushed: string[] = []
+
+    // Controllable transcript lines emitter: we resolve this to send a JSONL line.
+    let emitLine!: (line: string) => void
+    const lineQueue: string[] = []
+    const lineWaiters: Array<(r: IteratorResult<string>) => void> = []
+    function notifyLine(line: string) {
+      const w = lineWaiters.shift()
+      if (w) w({ value: line, done: false })
+      else lineQueue.push(line)
+    }
+    emitLine = notifyLine
+    const controlledStream: TranscriptStream = {
+      lines: {
+        [Symbol.asyncIterator]() {
+          return {
+            next(): Promise<IteratorResult<string>> {
+              if (lineQueue.length > 0) {
+                const line = lineQueue.shift()!
+                return Promise.resolve({ value: line, done: false })
+              }
+              return new Promise((resolve) => { lineWaiters.push(resolve) })
+            },
+          }
+        },
+      },
+      filePath: Promise.resolve("/tmp/x.jsonl"),
+      close: () => {
+        const w = lineWaiters.shift()
+        if (w) w({ value: undefined as unknown as string, done: true })
+      },
+    }
+
+    const fakePty = {
+      pid: 33333,
+      sendInput: async (d: string) => { if (d.includes("/exit")) exitCalls.push(d) },
+      resize() {},
+      exited: new Promise<number>(() => {}),
+      close: () => {},
+      kill: () => {},
+    } as unknown as PtyProcess
+
+    const fakeHandle = {
+      url: "http://127.0.0.1:1/mcp",
+      bearerToken: "t",
+      close: async () => {},
+      channelClientReady: Promise.resolve(),
+      pushChannelPrompt: async (c: string) => { pushed.push(c) },
+    }
+
+    const handle = await startClaudeSessionPTY({
+      chatId: "ka-test", projectId: "p1", localPath: "/tmp",
+      model: "claude-sonnet-4-6", planMode: false, forkSession: false,
+      oauthToken: "sk-ant-oat01-x", sessionToken: null,
+      systemPromptOverride: "You are a subagent.",
+      initialPrompt: "turn one",
+      oneShot: true,
+      keepAlive: true,
+      onToolRequest: async () => null,
+      env: { ...process.env, KANNA_PTY_TRUST_DISMISS: "disabled", KANNA_PTY_CHANNEL_DELIVERY: "enabled", KANNA_PTY_TUI_BOOT_MS: "10" },
+      startKannaMcpHttpServer: (async () => fakeHandle) as never,
+      spawnPtyProcess: (async () => fakePty) as never,
+      startTranscriptStreamFn: (async () => controlledStream) as never,
+      smokeTestGate: { canSpawn: async () => ({ ok: true }) },
+    })
+
+    // Emit a result JSONL line (precede with a user line so turnState enters "inTurn")
+    emitLine(JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "text", text: "turn one" }] }, isMeta: false }))
+    emitLine(JSON.stringify({ type: "result", subtype: "success", result: "done", durationMs: 100, durationApiMs: 100, isError: false, totalCostUSD: 0 }))
+
+    // Give the async event loop time to process the JSONL lines
+    await new Promise((r) => setTimeout(r, 150))
+
+    // REPL must remain alive — no /exit should have been sent
+    expect(exitCalls).toHaveLength(0)
+
+    // Turn 1 delivered via channel
+    expect(pushed).toEqual(["turn one"])
+
+    // handle must expose pushChannelPrompt
+    expect(typeof handle.pushChannelPrompt).toBe("function")
+
+    // Turn 2 can be pushed into the warm session
+    await handle.pushChannelPrompt!("turn two")
+    expect(pushed).toEqual(["turn one", "turn two"])
+
+    handle.close()
+  }, 10_000)
+
+  test("keepAlive omitted on oneShot: handle.pushChannelPrompt is undefined", async () => {
+    if (process.platform === "win32") return
+    const fakePty = {
+      pid: 44444,
+      sendInput: async () => {},
+      resize() {},
+      exited: new Promise<number>(() => {}),
+      close: () => {},
+      kill: () => {},
+    } as unknown as PtyProcess
+    const fakeHandle = {
+      url: "http://127.0.0.1:1/mcp", bearerToken: "t", close: async () => {},
+      channelClientReady: Promise.resolve(),
+      pushChannelPrompt: async () => {},
+    }
+    const handle = await startClaudeSessionPTY({
+      chatId: "ka-neg", projectId: "p1", localPath: "/tmp",
+      model: "claude-sonnet-4-6", planMode: false, forkSession: false,
+      oauthToken: "sk-ant-oat01-x", sessionToken: null,
+      systemPromptOverride: "You are a subagent.",
+      initialPrompt: "hello",
+      oneShot: true,
+      // keepAlive intentionally omitted
+      onToolRequest: async () => null,
+      env: { ...process.env, KANNA_PTY_TRUST_DISMISS: "disabled", KANNA_PTY_CHANNEL_DELIVERY: "enabled", KANNA_PTY_TUI_BOOT_MS: "10" },
+      startKannaMcpHttpServer: (async () => fakeHandle) as never,
+      spawnPtyProcess: (async () => fakePty) as never,
+      startTranscriptStreamFn: (async () => ({ lines: (async function* () {})(), filePath: Promise.resolve("/tmp/x.jsonl"), close: () => {} })) as never,
+      smokeTestGate: { canSpawn: async () => ({ ok: true }) },
+    })
+    expect(handle.pushChannelPrompt).toBeUndefined()
+    handle.close()
+  }, 10_000)
+})
+
 describe("channel-delivery (Task 5)", () => {
   test("oneShot channel delivery pushes initialPrompt via channel, not paste", async () => {
     if (process.platform === "win32") return
@@ -897,4 +1025,18 @@ describe("channel-delivery (Task 5)", () => {
     expect(ptyWrites.join("")).not.toContain("FULL MULTILINE PROMPT")
     expect(closed).toBe(true)
   }, 10_000)
+})
+
+describe("buildChannelPromptFraming", () => {
+  test("keep-alive subagent framing tells the model to expect multiple channel turns", () => {
+    const framing = buildChannelPromptFraming(true)
+    expect(framing).toMatch(/multiple/i)
+    expect(framing).toMatch(/channel/i)
+  })
+
+  test("one-shot framing stays single-turn (no multiple-message language)", () => {
+    const framing = buildChannelPromptFraming(false)
+    expect(framing).toMatch(/channel/i)
+    expect(framing).not.toMatch(/multiple/i)
+  })
 })

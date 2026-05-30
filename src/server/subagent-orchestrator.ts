@@ -60,6 +60,19 @@ function createDeferred<T>(): Deferred<T> {
   return { promise, resolve, reject }
 }
 
+/**
+ * Returned by a keep-alive provider run after its FIRST turn completes. Lets
+ * the orchestrator push further turns into the same warm session and close it.
+ */
+export interface LiveTurnSource {
+  runTurn(
+    prompt: string,
+    onChunk: (c: string) => void,
+    onEntry: (e: TranscriptEntry) => void,
+  ): Promise<{ text: string; usage?: ProviderUsage }>
+  close(): Promise<void>
+}
+
 export interface ProviderRunStart {
   provider: AgentProvider
   model: string
@@ -72,12 +85,16 @@ export interface ProviderRunStart {
    *  - `onEntry(entry)`: every TranscriptEntry — including the assistant_text
    *    entries forwarded to onChunk, plus tool_call / tool_result / result.
    *    Used to persist `subagent_entry_appended` events.
-   * Returns the final accumulated text + usage for the run_completed event.
+   *  - `opts.keepAlive`: when true and provider is "claude", leaves the
+   *    session open and returns `live` for driving subsequent turns.
+   * Returns the final accumulated text + usage for the run_completed event,
+   * plus an optional `live` handle when keep-alive was requested.
    */
   start: (
     onChunk: (chunk: string) => void,
     onEntry: (entry: TranscriptEntry) => void,
-  ) => Promise<{ text: string; usage?: ProviderUsage }>
+    opts?: { keepAlive?: boolean },
+  ) => Promise<{ text: string; usage?: ProviderUsage; live?: LiveTurnSource }>
   authReady: () => Promise<boolean>
 }
 
@@ -132,10 +149,21 @@ export interface SubagentOrchestratorDeps {
   maxParallel?: number
   maxChainDepth?: number
   runTimeoutMs?: number
+  /** Maximum number of live (keep-alive) sessions per chat. Default 5. */
+  maxLive?: number
+  /**
+   * Idle timeout in ms before a live session is auto-closed. Default 300_000.
+   * Env-var wiring (KANNA_SUBAGENT_IDLE_TIMEOUT_MS) is done at the
+   * dep-construction site (agent.ts); not read here to stay within the
+   * side-effect seal.
+   */
+  liveIdleTimeoutMs?: number
 }
 
 const DEFAULT_MAX_PARALLEL = 4
 const DEFAULT_MAX_CHAIN_DEPTH = 1
+const DEFAULT_MAX_LIVE = 5
+const DEFAULT_LIVE_IDLE_TIMEOUT_MS = 300_000
 
 /**
  * Terminal outcome of a single subagent run, surfaced to callers that
@@ -149,6 +177,16 @@ export type DelegationOutcome =
 // take minutes. 600s matches the default Bash tool wall-clock cap. Tests still
 // override via SubagentOrchestratorDeps.runTimeoutMs.
 const DEFAULT_RUN_TIMEOUT_MS = 600_000
+
+interface LiveSession {
+  chatId: string
+  runId: string
+  subagentId: string
+  parentRunId: string | null
+  live: LiveTurnSource
+  idleTimer: ReturnType<typeof setTimeout> | null
+  lastActivity: number
+}
 
 interface RunState {
   chatId: string
@@ -166,6 +204,7 @@ export class SubagentOrchestrator {
   private readonly waiters: Array<{ chatId: string; resolve: () => void; reject: (err: Error) => void }> = []
   private readonly cancelledChats = new Set<string>()
   private readonly runStateByRunId = new Map<string, RunState>()
+  private readonly liveSessions = new Map<string, LiveSession>()
 
   private readonly recoveryPromise: Promise<void>
 
@@ -214,6 +253,19 @@ export class SubagentOrchestrator {
   private maxDepth() { return this.deps.maxChainDepth ?? DEFAULT_MAX_CHAIN_DEPTH }
   private timeoutMs() { return this.deps.runTimeoutMs ?? DEFAULT_RUN_TIMEOUT_MS }
   private now() { return this.deps.now?.() ?? Date.now() }
+  private maxLive() { return this.deps.maxLive ?? DEFAULT_MAX_LIVE }
+  private idleTimeoutMs() { return this.deps.liveIdleTimeoutMs ?? DEFAULT_LIVE_IDLE_TIMEOUT_MS }
+
+  /** Test-only accessor: number of currently registered live sessions. */
+  liveSessionCount() { return this.liveSessions.size }
+
+  /**
+   * Look up a subagent by id from the current settings snapshot.
+   * Used by kanna-mcp to validate provider constraints before delegating.
+   */
+  findSubagent(id: string): Subagent | undefined {
+    return this.deps.appSettings.getSnapshot().subagents.find((s) => s.id === id)
+  }
 
   activePermitCount() {
     return this.maxParallel() - this.permits
@@ -292,6 +344,13 @@ export class SubagentOrchestrator {
       if (state.chatId === chatId) runIds.push(runId)
     }
     for (const runId of runIds) this.cancelRun(chatId, runId)
+    // Belt-and-suspenders: close any live sessions for this chat that may not
+    // have had a RunState entry (e.g. if cleanupRunState was already called).
+    // closeLiveRun is idempotent (early-returns if not in map), so calling it
+    // again for sessions already handled by cancelRun above is safe.
+    for (const s of [...this.liveSessions.values()]) {
+      if (s.chatId === chatId) void this.closeLiveRun(chatId, s.runId, "cancel")
+    }
   }
 
   cancelRun(chatId: string, runId: string): void {
@@ -316,6 +375,9 @@ export class SubagentOrchestrator {
       reject(new Error("USER_CANCELLED"))
     } else {
       state.abortController.abort()
+    }
+    if (this.liveSessions.has(runId)) {
+      void this.closeLiveRun(chatId, runId, "cancel")
     }
   }
 
@@ -426,6 +488,14 @@ export class SubagentOrchestrator {
      * on long-running subagent runs.
      */
     onEntry?: (entry: TranscriptEntry) => void
+    /**
+     * When true, requests that the provider keep the session alive after
+     * the first turn and returns a LiveTurnSource for subsequent turns.
+     * The live session is registered in `liveSessions` and the permit is
+     * released after the first turn (idle sessions hold no permit).
+     * Over `maxLive` live sessions per chat → CAP_EXCEEDED.
+     */
+    keepAlive?: boolean
   }): Promise<DelegationOutcome> {
     await this.recoveryPromise
     const subagent = this.deps.appSettings
@@ -495,6 +565,18 @@ export class SubagentOrchestrator {
         `Subagent ${subagent.name} already in ancestor chain`,
       )
     }
+    if (args.keepAlive) {
+      const liveForChat = [...this.liveSessions.values()].filter((s) => s.chatId === args.chatId).length
+      if (liveForChat >= this.maxLive()) {
+        const runId = crypto.randomUUID()
+        return await this.failRun(
+          args.chatId,
+          runId,
+          "CAP_EXCEEDED",
+          `Live session cap of ${this.maxLive()} reached for chat ${args.chatId}`,
+        )
+      }
+    }
     const outcome = await this.spawnRun({
       subagent,
       chatId: args.chatId,
@@ -504,6 +586,7 @@ export class SubagentOrchestrator {
       ancestorSubagentIds: args.ancestorSubagentIds,
       userInstruction: args.prompt,
       onEntry: args.onEntry,
+      keepAlive: args.keepAlive,
     })
     // Trace point: this is the return that flows back through the MCP
     // `delegate_subagent` tool to the parent claude as its tool_result.
@@ -536,6 +619,8 @@ export class SubagentOrchestrator {
     userInstruction: string
     /** External per-entry sink (see {@link delegateRun}). */
     onEntry?: (entry: TranscriptEntry) => void
+    /** When true, passes keepAlive to the provider run and registers a LiveSession on success. */
+    keepAlive?: boolean
   }): Promise<DelegationOutcome> {
     const runId = crypto.randomUUID()
     await this.deps.store.appendSubagentEvent({
@@ -645,6 +730,7 @@ export class SubagentOrchestrator {
 
       let finalText = ""
       let usage: ProviderUsage | undefined
+      let liveHandle: LiveTurnSource | undefined
       // Trailing-edge throttle handle for chunk-driven progress broadcasts.
       let chunkProgressTimer: ReturnType<typeof setTimeout> | null = null
       const CHUNK_PROGRESS_THROTTLE_MS = 100
@@ -715,7 +801,7 @@ export class SubagentOrchestrator {
         const abortRejection = createDeferred<never>()
         const abortListener = () => abortRejection.reject(new Error("USER_CANCELLED"))
         runState.abortController.signal.addEventListener("abort", abortListener, { once: true })
-        let result: { text: string; usage?: ProviderUsage }
+        let result: { text: string; usage?: ProviderUsage; live?: LiveTurnSource }
         try {
           // Fast-path: if already aborted, fire listener synchronously so the
           // race rejects on the next microtask. Doing this AFTER abortRejection.promise
@@ -724,7 +810,7 @@ export class SubagentOrchestrator {
             abortListener()
           }
           result = await Promise.race([
-            runStart.start(onChunk, onEntry),
+            runStart.start(onChunk, onEntry, { keepAlive: args.keepAlive }),
             timeoutRejection.promise,
             abortRejection.promise,
           ])
@@ -733,6 +819,7 @@ export class SubagentOrchestrator {
         }
         finalText = result.text
         usage = result.usage
+        liveHandle = result.live
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         let outcome: DelegationOutcome
@@ -834,10 +921,145 @@ export class SubagentOrchestrator {
           userInstruction: finalText,
         })
       }
+      if (args.keepAlive && liveHandle) {
+        const session: LiveSession = {
+          chatId: args.chatId,
+          runId,
+          subagentId: args.subagent.id,
+          parentRunId: args.parentRunId,
+          live: liveHandle,
+          idleTimer: null,
+          lastActivity: this.now(),
+        }
+        this.liveSessions.set(runId, session)
+        this.armIdleTimer(runId)
+        return { status: "completed", runId, text: finalText }
+      }
       return { status: "completed", runId, text: finalText }
     } finally {
       releaseSlot()
-      this.cleanupRunState(runId)
+      if (!this.liveSessions.has(runId)) this.cleanupRunState(runId)
+    }
+  }
+
+  private armIdleTimer(runId: string): void {
+    const s = this.liveSessions.get(runId)
+    if (!s) return
+    if (s.idleTimer) clearTimeout(s.idleTimer)
+    s.idleTimer = setTimeout(() => { void this.closeLiveRun(s.chatId, runId, "idle_timeout") }, this.idleTimeoutMs())
+  }
+
+  /**
+   * Send a follow-up prompt to an existing live (keep-alive) session.
+   * Acquires a permit for the duration of the turn, then releases it so
+   * idle sessions hold no permit between turns.
+   */
+  async sendToLiveRun(runId: string, prompt: string): Promise<DelegationOutcome> {
+    const session = this.liveSessions.get(runId)
+    if (!session) {
+      return { status: "failed", runId, errorCode: "NO_LIVE_SESSION", errorMessage: `No live subagent session ${runId}` }
+    }
+    // Pause idle timer while the turn is in flight.
+    if (session.idleTimer) { clearTimeout(session.idleTimer); session.idleTimer = null }
+
+    await this.acquire(session.chatId, runId)
+    let released = false
+    const releaseSlot = () => {
+      if (released) return
+      released = true
+      this.release()
+    }
+    try {
+      // Build inline sinks equivalent to those in spawnRun so events are
+      // persisted identically for follow-up turns. These capture turn-local
+      // mutable state (chunkProgressTimer) so they cannot be shared across
+      // concurrent turns on the same session.
+      const { chatId } = session
+      let chunkProgressTimer: ReturnType<typeof setTimeout> | null = null
+      const CHUNK_PROGRESS_THROTTLE_MS = 100
+
+      const onChunk = (chunk: string) => {
+        if (!chunk) return
+        this.deps.store
+          .appendSubagentEvent({
+            v: 3,
+            type: "subagent_message_delta",
+            timestamp: this.now(),
+            chatId,
+            runId,
+            content: chunk,
+          })
+          .catch((err) => {
+            console.warn(`${LOG_PREFIX} sendToLiveRun delta append failed`, { chatId, runId, err })
+          })
+        if (chunkProgressTimer !== null) clearTimeout(chunkProgressTimer)
+        chunkProgressTimer = setTimeout(() => {
+          chunkProgressTimer = null
+          this.deps.onRunProgress?.(chatId, runId)
+        }, CHUNK_PROGRESS_THROTTLE_MS)
+      }
+
+      const onEntry = (entry: TranscriptEntry) => {
+        this.deps.store
+          .appendSubagentEvent({
+            v: 3,
+            type: "subagent_entry_appended",
+            timestamp: this.now(),
+            chatId,
+            runId,
+            entry,
+          })
+          .catch((err) => {
+            console.warn(`${LOG_PREFIX} sendToLiveRun entry append failed`, { chatId, runId, err })
+          })
+        this.deps.onRunProgress?.(chatId, runId)
+      }
+
+      let turn: { text: string; usage?: ProviderUsage }
+      try {
+        turn = await session.live.runTurn(prompt, onChunk, onEntry)
+      } finally {
+        if (chunkProgressTimer !== null) {
+          clearTimeout(chunkProgressTimer)
+          chunkProgressTimer = null
+          this.deps.onRunProgress?.(session.chatId, runId)
+        }
+      }
+
+      session.lastActivity = this.now()
+      this.armIdleTimer(runId)
+      return { status: "completed", runId, text: turn.text }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      await this.closeLiveRun(session.chatId, runId, "error")
+      return { status: "failed", runId, errorCode: "PROVIDER_ERROR", errorMessage: message }
+    } finally {
+      releaseSlot()
+    }
+  }
+
+  /**
+   * Close a live session and clean up its resources. Makes the session
+   * ineligible for further turns, clears the idle timer, closes the
+   * underlying LiveTurnSource, cleans up RunState, and notifies the
+   * terminal callback so external resolvers (e.g. subagentPendingResolvers
+   * on AgentCoordinator) are released.
+   */
+  async closeLiveRun(
+    chatId: string,
+    runId: string,
+    reason: "explicit" | "idle_timeout" | "error" | "cancel",
+  ): Promise<void> {
+    const s = this.liveSessions.get(runId)
+    if (!s) return
+    this.liveSessions.delete(runId)
+    if (s.idleTimer) { clearTimeout(s.idleTimer); s.idleTimer = null }
+    try { await s.live.close() } catch (err) {
+      console.warn(`${LOG_PREFIX} live close failed`, { chatId, runId, reason, err })
+    }
+    this.cleanupRunState(runId)
+    try { this.deps.onRunTerminal?.(chatId, runId, "completed") } catch (err) {
+      console.warn(`${LOG_PREFIX} onRunTerminal(completed) threw in closeLiveRun`, { chatId, runId, err })
     }
   }
 

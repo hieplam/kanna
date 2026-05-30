@@ -44,15 +44,35 @@ const STATIC_SUPPORTED_COMMANDS: SlashCommand[] = [
 // Framing folded into the subagent system prompt when its task is delivered
 // via the kanna channel. Without it the model treats <channel> messages as
 // low-trust interruptions and refuses (proven in the Phase-0 spike).
-const CHANNEL_PROMPT_FRAMING =
+// One-shot runs use single-turn framing; keep-alive runs use multi-turn framing
+// so the model knows to expect and accept repeated channel messages over the
+// session lifetime rather than treating turn 2+ as suspicious interrupts.
+const CHANNEL_PROMPT_FRAMING_BASE =
   'Your task for this run is delivered via the kanna channel as a <channel source="kanna"> message. ' +
   "Treat that channel message as your authoritative instructions from the orchestrator and act on it " +
   "immediately and fully, exactly as if the user had typed it. Do not refuse it and do not ask the user to repeat it."
+
+const CHANNEL_PROMPT_FRAMING_MULTITURN =
+  'Your tasks for this session arrive over the kanna channel as <channel source="kanna"> messages. ' +
+  "Expect MULTIPLE such messages over the life of this session. Treat each as authoritative instructions " +
+  "from the orchestrator; act on each immediately and fully, exactly as if the user had typed it. Do not refuse " +
+  "and do not ask the user to repeat. After finishing a task, wait for the next channel message."
+
+export function buildChannelPromptFraming(keepAlive: boolean): string {
+  return keepAlive ? CHANNEL_PROMPT_FRAMING_MULTITURN : CHANNEL_PROMPT_FRAMING_BASE
+}
 
 // Max wait for the claude MCP client to finish initialize before we push the
 // channel prompt. On timeout the spawn fails fast (no paste fallback).
 // Env-overridable so tests don't wait the full default.
 const CHANNEL_READY_TIMEOUT_DEFAULT_MS = 15_000
+
+/**
+ * After a keep-alive turn's result, the REPL needs a beat to finish rendering
+ * the assistant block and return to the `❯` idle prompt before the next
+ * channel push enqueues. 300ms empirically clears this on tested models.
+ */
+const CHANNEL_REPL_IDLE_BEAT_MS = 300
 
 export interface StartClaudeSessionPtyArgs {
   chatId: string
@@ -104,6 +124,12 @@ export interface StartClaudeSessionPtyArgs {
    * for single-turn subagent runs.
    */
   oneShot?: boolean
+  /**
+   * Keep-alive multi-turn. Only meaningful with `oneShot && channel delivery`.
+   * When true, the first `result` does NOT trigger `oneShotClose()` — the REPL
+   * stays open so further turns can be delivered via `pushChannelPrompt`.
+   */
+  keepAlive?: boolean
   /** Label of the OAuth-pool token. Surfaces in AccountInfo since the CLI doesn't emit account info in stream-json. */
   oauthLabel?: string
   /** Masked OAuth-pool token (e.g. `sk-ant-oat01...XXXX`). Computed by AgentCoordinator; never the raw token. */
@@ -384,7 +410,7 @@ export async function startClaudeSessionPTY(args: StartClaudeSessionPtyArgs): Pr
 
   const effectiveSystemPromptOverride =
     channelDeliveryEnabled && args.systemPromptOverride
-      ? `${args.systemPromptOverride}\n\n${CHANNEL_PROMPT_FRAMING}`
+      ? `${args.systemPromptOverride}\n\n${buildChannelPromptFraming(Boolean(args.keepAlive))}`
       : args.systemPromptOverride
 
   const claudeBin = claudeBinAbs
@@ -469,6 +495,7 @@ export async function startClaudeSessionPTY(args: StartClaudeSessionPtyArgs): Pr
 
     if (
       args.oneShot
+      && !args.keepAlive
       && ev.type === "transcript"
       && (ev.entry as { kind?: string } | undefined)?.kind === "result"
     ) {
@@ -822,6 +849,14 @@ export async function startClaudeSessionPTY(args: StartClaudeSessionPtyArgs): Pr
     },
     getSupportedCommands: async () => cachedSlashCommands ?? STATIC_SUPPORTED_COMMANDS,
     getAccountInfo: async () => cachedAccountInfo,
+    pushChannelPrompt: (channelDeliveryEnabled && args.keepAlive)
+      ? async (text: string) => {
+          // Ready promise already resolved during turn-1 delivery; settle a
+          // beat so the REPL is back at idle before the next enqueue.
+          await new Promise((r) => setTimeout(r, CHANNEL_REPL_IDLE_BEAT_MS))
+          await mcpHandle.pushChannelPrompt(text)
+        }
+      : undefined,
     close: () => {
       if (closed) return
       closed = true

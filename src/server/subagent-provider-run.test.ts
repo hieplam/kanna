@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import type { ClaudeModelOptions, Subagent, TranscriptEntry } from "../shared/types"
 import type { HarnessEvent, HarnessTurn, HarnessToolRequest } from "./harness-types"
 import type { StartCodexSessionArgs, CodexSessionScope } from "./codex-app-server"
-import { buildSubagentProviderRun, composeInitialPrompt, composeSubagentSystemPrompt, type BuildSubagentProviderRunArgs } from "./subagent-provider-run"
+import { buildSubagentProviderRun, composeInitialPrompt, composeSubagentSystemPrompt, drainOneTurn, type BuildSubagentProviderRunArgs } from "./subagent-provider-run"
 import type { StartCodexTurnArgs } from "./codex-app-server"
 
 // ---------------------------------------------------------------------------
@@ -432,5 +432,314 @@ describe("buildSubagentProviderRun – Codex", () => {
     expect((err as Error)?.message).toBe("codex start turn failed")
 
     expect(calls).toEqual(["startSession", "startTurn", "stopSession:sub:run-fail"])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// keep-alive / LiveTurnSource
+// ---------------------------------------------------------------------------
+
+describe("buildSubagentProviderRun – keep-alive Claude", () => {
+  test("keep-alive claude run returns a live source that drives turn 2", async () => {
+    // A simple push-queue that lets the test feed events into the stream
+    // in sync with what the implementation requests.
+    const queue: Array<{ resolve: (r: IteratorResult<HarnessEvent>) => void }> = []
+    const pending: HarnessEvent[] = []
+    let done = false
+
+    async function nextFromQueue(): Promise<IteratorResult<HarnessEvent>> {
+      if (pending.length > 0) {
+        return { value: pending.shift()!, done: false }
+      }
+      if (done) return { value: undefined as never, done: true }
+      return new Promise<IteratorResult<HarnessEvent>>((resolve) => {
+        queue.push({ resolve })
+      })
+    }
+
+    function pushEvent(ev: HarnessEvent) {
+      if (queue.length > 0) {
+        queue.shift()!.resolve({ value: ev, done: false })
+      } else {
+        pending.push(ev)
+      }
+    }
+
+    const feedableStream: AsyncIterable<HarnessEvent> = {
+      [Symbol.asyncIterator]() {
+        return { next: nextFromQueue }
+      },
+    }
+
+    const pushed: string[] = []
+    let closed = false
+
+    const args = makeArgs({
+      startClaudeSession: async () => ({
+        provider: "claude" as const,
+        stream: feedableStream,
+        interrupt: async () => {},
+        close: () => { closed = true },
+        sendPrompt: async () => {},
+        setModel: async () => {},
+        setPermissionMode: async () => {},
+        getSupportedCommands: async () => [],
+        pushChannelPrompt: async (text: string) => {
+          pushed.push(text)
+          // Feed a reply for this prompt and then a result
+          pushEvent(makeTextEvent(`r:${text}`))
+          pushEvent(makeResultEvent())
+        },
+      }),
+    })
+
+    // Pre-feed turn-1 events BEFORE calling start so the iterator sees them
+    pushEvent(makeTextEvent("t1"))
+    pushEvent(makeResultEvent())
+
+    const run = buildSubagentProviderRun(args)
+    const first = await run.start(() => {}, () => {}, { keepAlive: true })
+
+    expect(first.text).toBe("t1")
+    expect(first.live).toBeDefined()
+
+    const second = await first.live!.runTurn("hi", () => {}, () => {})
+    expect(pushed).toEqual(["hi"])
+    expect(second.text).toBe("r:hi")
+
+    await first.live!.close()
+    expect(closed).toBe(true)
+  })
+
+  test("keep-alive without pushChannelPrompt fails closed and closes session", async () => {
+    let sessionClosed = false
+
+    const args = makeArgs({
+      startClaudeSession: async () => ({
+        provider: "claude" as const,
+        stream: makeHarnessTurn([makeTextEvent("t1"), makeResultEvent()]).stream,
+        interrupt: async () => {},
+        close: () => { sessionClosed = true },
+        sendPrompt: async () => {},
+        setModel: async () => {},
+        setPermissionMode: async () => {},
+        getSupportedCommands: async () => [],
+        // no pushChannelPrompt — keep-alive must fail closed
+      }),
+    })
+
+    const run = buildSubagentProviderRun(args)
+    let err: unknown = null
+    try {
+      await run.start(() => {}, () => {}, { keepAlive: true })
+    } catch (e) {
+      err = e
+    }
+    expect((err as Error)?.message).toContain("pushChannelPrompt missing")
+    expect(sessionClosed).toBe(true)
+  })
+
+  test("keepAlive:false preserves one-shot semantics (session closed after run)", async () => {
+    let sessionClosed = false
+
+    const args = makeArgs({
+      startClaudeSession: async () => ({
+        provider: "claude" as const,
+        stream: makeHarnessTurn([makeTextEvent("one-shot"), makeResultEvent()]).stream,
+        interrupt: async () => {},
+        close: () => { sessionClosed = true },
+        sendPrompt: async () => {},
+        setModel: async () => {},
+        setPermissionMode: async () => {},
+        getSupportedCommands: async () => [],
+      }),
+    })
+
+    const run = buildSubagentProviderRun(args)
+    const result = await run.start(() => {}, () => {}, { keepAlive: false })
+    expect(result.text).toBe("one-shot")
+    expect(result.live).toBeUndefined()
+    expect(sessionClosed).toBe(true)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// drainOneTurn
+// ---------------------------------------------------------------------------
+
+describe("drainOneTurn", () => {
+  /** Returns a single AsyncIterator that advances through events on each next() call. */
+  function makeIterator(events: HarnessEvent[]): AsyncIterator<HarnessEvent> {
+    let i = 0
+    return {
+      async next() {
+        if (i < events.length) return { value: events[i++] as HarnessEvent, done: false }
+        return { value: undefined as never, done: true }
+      },
+    }
+  }
+
+  test("returns text at first result and leaves iterator open", async () => {
+    // Build minimally-valid TranscriptEntry fixtures via cast (test file is lint-exempt)
+    const events: HarnessEvent[] = [
+      {
+        type: "transcript",
+        entry: { _id: "e1", createdAt: 1, kind: "assistant_text", text: "hello " } as TranscriptEntry,
+      },
+      {
+        type: "transcript",
+        entry: { _id: "e2", createdAt: 2, kind: "assistant_text", text: "world" } as TranscriptEntry,
+      },
+      {
+        type: "transcript",
+        entry: {
+          _id: "e3",
+          createdAt: 3,
+          kind: "result",
+          subtype: "success",
+          isError: false,
+          durationMs: 10,
+          result: "done",
+        } as TranscriptEntry,
+      },
+      // This event belongs to a second turn — drainOneTurn must NOT consume it
+      {
+        type: "transcript",
+        entry: { _id: "e4", createdAt: 4, kind: "assistant_text", text: "TURN2" } as TranscriptEntry,
+      },
+    ]
+
+    const it = makeIterator(events)
+    const chunks: string[] = []
+    const entries: TranscriptEntry[] = []
+    const out = await drainOneTurn(it, (c) => chunks.push(c), (e) => entries.push(e))
+
+    expect(out.text).toBe("hello world")
+    expect(chunks).toEqual(["hello ", "world"])
+    expect(out.sawResult).toBe(true)
+    expect(out.sawError).toBe(false)
+
+    // Iterator is still open — TURN2 event must still be consumable.
+    // makeIterator returns the same object, so .next() resumes from where drain stopped.
+    const next = await it.next()
+    expect((next.value as HarnessEvent).entry?.kind).toBe("assistant_text")
+    expect(
+      ((next.value as HarnessEvent).entry as { kind: "assistant_text"; text: string } & TranscriptEntry).text,
+    ).toBe("TURN2")
+  })
+
+  test("propagates usage fields from result entry", async () => {
+    const it = makeIterator([
+      {
+        type: "transcript",
+        entry: {
+          _id: "r1",
+          createdAt: 1,
+          kind: "result",
+          subtype: "success",
+          isError: false,
+          durationMs: 50,
+          result: "ok",
+          costUsd: 0.042,
+          usage: { inputTokens: 10, outputTokens: 5, cachedInputTokens: 2 },
+        } as TranscriptEntry,
+      },
+    ])
+    const out = await drainOneTurn(it, () => {}, () => {})
+    expect(out.usage?.inputTokens).toBe(10)
+    expect(out.usage?.outputTokens).toBe(5)
+    expect(out.usage?.cachedInputTokens).toBe(2)
+    expect(out.usage?.costUsd).toBe(0.042)
+    expect(out.sawResult).toBe(true)
+  })
+
+  test("sets sawError when api_error entry is received", async () => {
+    const it = makeIterator([
+      {
+        type: "transcript",
+        entry: {
+          _id: "ae1",
+          createdAt: 1,
+          kind: "api_error",
+          status: 500,
+          text: "internal server error",
+        } as TranscriptEntry,
+      },
+      {
+        type: "transcript",
+        entry: {
+          _id: "r2",
+          createdAt: 2,
+          kind: "result",
+          subtype: "error",
+          isError: true,
+          durationMs: 10,
+          result: "failed",
+        } as TranscriptEntry,
+      },
+    ])
+    const out = await drainOneTurn(it, () => {}, () => {})
+    expect(out.sawError).toBe(true)
+    expect(out.sawResult).toBe(true)
+  })
+
+  test("skips non-transcript events", async () => {
+    const it = makeIterator([
+      { type: "session_token", sessionToken: "tok123" },
+      {
+        type: "transcript",
+        entry: { _id: "t1", createdAt: 1, kind: "assistant_text", text: "hi" } as TranscriptEntry,
+      },
+      {
+        type: "transcript",
+        entry: {
+          _id: "r3",
+          createdAt: 2,
+          kind: "result",
+          subtype: "success",
+          isError: false,
+          durationMs: 5,
+          result: "ok",
+        } as TranscriptEntry,
+      },
+    ])
+    const chunks: string[] = []
+    const out = await drainOneTurn(it, (c) => chunks.push(c), () => {})
+    expect(chunks).toEqual(["hi"])
+    expect(out.text).toBe("hi")
+    expect(out.sawResult).toBe(true)
+  })
+
+  test("empty/premature-close: done before any result → not a successful turn", async () => {
+    // An iterator that closes immediately (e.g. driver crashed before sending result).
+    // Multi-turn callers depend on sawResult===false to detect this condition.
+    const it = makeIterator([])
+    const out = await drainOneTurn(it, () => {}, () => {})
+    expect(out.text).toBe("")
+    expect(out.usage).toBeUndefined()
+    expect(out.sawResult).toBe(false)
+    expect(out.sawError).toBe(false)
+  })
+
+  test("result with isError:true (no preceding api_error) sets sawError via result branch", async () => {
+    // PTY-synth error path: the driver synthesises a result entry with isError:true
+    // directly, without emitting a separate api_error entry first.
+    const it = makeIterator([
+      {
+        type: "transcript",
+        entry: {
+          _id: "synth1",
+          createdAt: 1,
+          kind: "result",
+          subtype: "error",
+          isError: true,
+          durationMs: 0,
+          result: "process died",
+        } as TranscriptEntry,
+      },
+    ])
+    const out = await drainOneTurn(it, () => {}, () => {})
+    expect(out.sawResult).toBe(true)
+    expect(out.sawError).toBe(true)
   })
 })
