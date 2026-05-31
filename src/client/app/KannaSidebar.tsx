@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react"
-import { Download, Flower, PanelLeft, X, Menu, Plus, Settings } from "lucide-react"
+import { ChevronsDownUp, ChevronsUpDown, Download, Flower, PanelLeft, X, Menu, Plus, Settings } from "lucide-react"
 import { useLocation, useNavigate } from "react-router-dom"
 import { APP_NAME } from "../../shared/branding"
 import { Button } from "../components/ui/button"
@@ -274,6 +274,26 @@ function KannaSidebarImpl({
       return next
     })
   }, [])
+
+  const allSidebarGroupKeys = useMemo(
+    () => [...data.starredProjectGroups, ...data.projectGroups].map((g) => g.groupKey),
+    [data.starredProjectGroups, data.projectGroups]
+  )
+  const expandedGroupsSnapshotRef = useRef<Set<string>>(new Set())
+  const allSectionsCollapsed = allSidebarGroupKeys.length > 0
+    && allSidebarGroupKeys.every((key) => collapsedSections.has(key))
+
+  const toggleAllSections = useCallback(() => {
+    if (allSidebarGroupKeys.length === 0) return
+    if (allSectionsCollapsed) {
+      setCollapsedSections(new Set())
+      setExpandedGroups(expandedGroupsSnapshotRef.current)
+      return
+    }
+    expandedGroupsSnapshotRef.current = expandedGroups
+    setCollapsedSections(new Set(allSidebarGroupKeys))
+    setExpandedGroups(new Set())
+  }, [allSidebarGroupKeys, allSectionsCollapsed, expandedGroups])
 
   const renderChatRow = useCallback((chat: SidebarChatRow) => {
     const visibleIndex = visibleIndexByChatId.get(chat.chatId)
@@ -686,6 +706,29 @@ function KannaSidebarImpl({
                 </div>
               )
             })()}
+
+            {allSidebarGroupKeys.length > 0 && (
+              <div className="flex justify-end px-1 pt-1 pb-2">
+                <button
+                  type="button"
+                  onClick={toggleAllSections}
+                  aria-pressed={allSectionsCollapsed}
+                  className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] text-muted-foreground hover:text-foreground hover:bg-muted/60 transition-colors duration-150 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+                >
+                  {allSectionsCollapsed ? (
+                    <>
+                      <ChevronsUpDown className="size-3" />
+                      Expand all
+                    </>
+                  ) : (
+                    <>
+                      <ChevronsDownUp className="size-3" />
+                      Collapse all
+                    </>
+                  )}
+                </button>
+              </div>
+            )}
 
             {starredProjectGroupsWithoutStackChats.length > 0 && (
               <>
