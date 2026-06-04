@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react"
-import { ChevronsDownUp, ChevronsUpDown, Download, Flower, PanelLeft, X, Menu, Plus, Settings } from "lucide-react"
+import { Download, Flower, FoldVertical, PanelLeft, UnfoldVertical, X, Menu, Plus, Settings } from "lucide-react"
 import { useLocation, useNavigate } from "react-router-dom"
 import { APP_NAME } from "../../shared/branding"
 import { Button } from "../components/ui/button"
@@ -611,16 +611,16 @@ function KannaSidebarImpl({
               type="button"
               onClick={toggleAllSections}
               aria-pressed={allSectionsCollapsed}
-              className="inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-[11px] font-medium text-muted-foreground hover:text-foreground hover:bg-muted/60 transition-colors duration-150 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+              className="group/collapse-all inline-flex items-center gap-1.5 rounded-full border border-border/50 bg-transparent px-2.5 py-1 text-xs font-medium tracking-[0.005em] text-muted-foreground hover:border-border hover:bg-muted/50 hover:text-foreground aria-pressed:border-border aria-pressed:bg-muted/40 aria-pressed:text-foreground transition-colors duration-150 motion-reduce:transition-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
             >
               {allSectionsCollapsed ? (
                 <>
-                  <ChevronsUpDown className="size-3" />
+                  <UnfoldVertical className="size-3.5 text-muted-foreground/80 group-hover/collapse-all:text-foreground group-aria-pressed/collapse-all:text-foreground transition-colors duration-150 motion-reduce:transition-none" aria-hidden />
                   Expand all
                 </>
               ) : (
                 <>
-                  <ChevronsDownUp className="size-3" />
+                  <FoldVertical className="size-3.5 text-muted-foreground/80 group-hover/collapse-all:text-foreground transition-colors duration-150 motion-reduce:transition-none" aria-hidden />
                   Collapse all
                 </>
               )}
