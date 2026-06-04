@@ -47,4 +47,24 @@ describe("ChatPreferenceControls", () => {
     expect(html).toContain("1M")
     expect(html).toContain("Plan Mode")
   })
+
+  test("preference popover triggers carry mobile-friendly tap affordances", () => {
+    const html = renderToStaticMarkup(
+      <ChatPreferenceControls
+        availableProviders={PROVIDERS}
+        selectedProvider="claude"
+        model="claude-opus-4-7"
+        modelOptions={{ reasoningEffort: "high", contextWindow: "1m" }}
+        onProviderChange={() => {}}
+        onModelChange={() => {}}
+        onModelOptionChange={() => {}}
+        planMode={false}
+        onPlanModeChange={() => {}}
+      />
+    )
+    // Every InputPopover trigger should have at least one min-h-[36px] +
+    // touch-manipulation pair so taps register reliably on mobile.
+    expect(html).toContain("min-h-[36px]")
+    expect(html).toContain("touch-manipulation")
+  })
 })

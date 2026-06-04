@@ -1,11 +1,10 @@
 import { describe, expect, test } from "bun:test"
 import { renderToStaticMarkup } from "react-dom/server"
 import type { ContextWindowSnapshot } from "../../lib/contextWindow"
-import { TooltipProvider } from "../ui/tooltip"
 import { SessionTokenPill } from "./SessionTokenPill"
 
 function renderPill(node: React.ReactNode): string {
-  return renderToStaticMarkup(<TooltipProvider>{node}</TooltipProvider>)
+  return renderToStaticMarkup(<>{node}</>)
 }
 
 function snapshot(partial: Partial<ContextWindowSnapshot>): ContextWindowSnapshot {
@@ -71,5 +70,18 @@ describe("SessionTokenPill", () => {
     )
     expect(html).toContain("aria-label=")
     expect(html).toContain("Session tokens")
+  })
+
+  test("renders a tappable button (popover trigger, not a tooltip)", () => {
+    const html = renderPill(
+      <SessionTokenPill usage={snapshot({ inputTokens: 100, outputTokens: 20 })} />,
+    )
+    // Popover trigger: cursor-pointer + touch-manipulation, no cursor-default.
+    expect(html).toContain("cursor-pointer")
+    expect(html).toContain("touch-manipulation")
+    expect(html).not.toContain("cursor-default")
+    // Radix popover trigger annotates the button with aria-expanded / data-state.
+    expect(html).toMatch(/aria-expanded=/)
+    expect(html).toMatch(/data-state="closed"/)
   })
 })
