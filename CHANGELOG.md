@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.86.0](https://github.com/cuongtranba/kanna/compare/v0.85.2...v0.86.0) (2026-06-05)
+
+
+### Features
+
+* **messages:** always render file card for local file links ([#377](https://github.com/cuongtranba/kanna/issues/377)) ([e864cc6](https://github.com/cuongtranba/kanna/commit/e864cc66726c00a9bb9b5892e9aeedd026268a54))
+
+
+### Bug Fixes
+
+* **chat-ui:** make composer toolbar tappable on mobile ([#378](https://github.com/cuongtranba/kanna/issues/378)) ([73f1fd4](https://github.com/cuongtranba/kanna/commit/73f1fd40e655086c42cdb20bbf1d205c41003eb1))
+
 ## [0.85.2](https://github.com/cuongtranba/kanna/compare/v0.85.1...v0.85.2) (2026-06-04)
 
 
