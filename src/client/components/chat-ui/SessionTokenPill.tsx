@@ -4,7 +4,7 @@ import {
   formatContextWindowTokens,
 } from "../../lib/contextWindow"
 import { cn } from "../../lib/utils"
-import { Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip"
+import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover"
 
 interface SessionTokenPillProps {
   usage: ContextWindowSnapshot | null
@@ -20,13 +20,13 @@ export function SessionTokenPill({ usage, className }: SessionTokenPillProps) {
     : formatCachePercentage(summary.cacheHitPercentage)
 
   return (
-    <Tooltip delayDuration={0}>
-      <TooltipTrigger asChild>
+    <Popover>
+      <PopoverTrigger asChild>
         <button
           type="button"
           aria-label={buildAriaLabel(summary, cacheLabel)}
           className={cn(
-            "inline-flex cursor-default items-center gap-1.5 rounded-md bg-muted/30 px-2 py-0.5 text-xs tabular-nums text-muted-foreground",
+            "inline-flex min-h-[36px] cursor-pointer touch-manipulation items-center gap-1.5 rounded-md bg-muted/30 px-2.5 py-1.5 text-xs tabular-nums text-muted-foreground transition-colors hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
             className,
           )}
         >
@@ -42,8 +42,8 @@ export function SessionTokenPill({ usage, className }: SessionTokenPillProps) {
             )
             : null}
         </button>
-      </TooltipTrigger>
-      <TooltipContent side="top" align="center" className="w-max max-w-none px-3 py-2">
+      </PopoverTrigger>
+      <PopoverContent side="top" align="center" className="w-max max-w-none px-3 py-2">
         <div className="space-y-1 text-xs leading-tight">
           <Row label="Input" value={formatContextWindowTokens(summary.input)} />
           <Row label="Output" value={formatContextWindowTokens(summary.output)} />
@@ -52,8 +52,8 @@ export function SessionTokenPill({ usage, className }: SessionTokenPillProps) {
             ? <Row label="Cache hit" value={cacheLabel} />
             : null}
         </div>
-      </TooltipContent>
-    </Tooltip>
+      </PopoverContent>
+    </Popover>
   )
 }
 

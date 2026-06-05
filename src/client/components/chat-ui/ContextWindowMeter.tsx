@@ -1,6 +1,6 @@
 import { cn } from "../../lib/utils"
 import { type ContextWindowSnapshot, formatContextWindowTokens } from "../../lib/contextWindow"
-import { Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip"
+import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover"
 
 function formatPercentage(value: number | null): string | null {
   if (value === null || !Number.isFinite(value)) {
@@ -20,11 +20,11 @@ export function ContextWindowMeter({ usage }: { usage: ContextWindowSnapshot }) 
   const dashOffset = circumference - (normalizedPercentage / 100) * circumference
 
   return (
-    <Tooltip delayDuration={0}>
-      <TooltipTrigger asChild>
+    <Popover>
+      <PopoverTrigger asChild>
         <button
           type="button"
-          className="group inline-flex items-center justify-center rounded-full transition-opacity hover:opacity-85"
+          className="group inline-flex h-9 w-9 cursor-pointer touch-manipulation items-center justify-center rounded-full transition-opacity hover:opacity-85 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           aria-label={
             usage.maxTokens !== undefined && usedPercentage
               ? `Context window ${usedPercentage} used`
@@ -71,8 +71,8 @@ export function ContextWindowMeter({ usage }: { usage: ContextWindowSnapshot }) 
             </span>
           </span>
         </button>
-      </TooltipTrigger>
-      <TooltipContent side="top" align="center" className="w-max max-w-none px-3 py-2">
+      </PopoverTrigger>
+      <PopoverContent side="top" align="center" className="w-max max-w-none px-3 py-2">
         <div className="space-y-1.5 leading-tight">
           {usage.maxTokens !== undefined && usedPercentage ? (
             <div className="whitespace-nowrap text-xs font-medium text-foreground">
@@ -88,7 +88,7 @@ export function ContextWindowMeter({ usage }: { usage: ContextWindowSnapshot }) 
             </div>
           )}
         </div>
-      </TooltipContent>
-    </Tooltip>
+      </PopoverContent>
+    </Popover>
   )
 }
